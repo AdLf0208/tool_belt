@@ -1,0 +1,25 @@
+id = "toolbelt"
+name = "Tool Belt"
+version = "0.2.0"
+description = """A port of Tool Belt for Horizon: a belt item that stores tools in its own
+2-to-9 slots. A right click with an allowed off-hand stack inserts it, a sneak right click
+moves the first stored tool back to the inventory, and any other right click opens the belt
+menu, whose slots give a stack back on a click. /toolbelt put|take|info|menu|help drives the
+same storage from the keyboard. The radial key menu, wearing the belt, the upgrades and the
+pouch are not ported yet."""
+authors = ["David Quintana", "AdLf0208"]
+# A native mod: Rust in src/, compiled by the launcher against the game build [native] pins,
+# beside data/ and assets/. The id is the resource namespace and the only identity: Cargo's
+# package name and version are not the mod's.
+api = "0.2"
+# "both" is the installation side, not the hook's: an integrated server belongs to the
+# client installation, so a LAN host or a single-player world needs both.
+side = "both"
+# The one shared value every manifest carries ("May add blocks, items, mob effects and entity
+# types"): the belt item, its recipe and its assets are content this package registers.
+capabilities = ["registries"]
+
+[native]
+game = "26.3"
+horizon = "0b14f8acfd97fa2c750e42795249dcc981178ca4"
+mixins = "e59da9094f0c2fdda6c627fe9eff22dec6a906f0"
