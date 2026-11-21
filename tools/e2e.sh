@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # In-game check for Tool Belt slice 1: the belt item, its storage and menu.
 #
-# One offscreen creative launch in The End on a floor, then:
+# A launcher-built game carrying this flat SDK package (the belt item, its
+# content and its Rust all live in one `.hmod`), one offscreen creative launch in
+# The End on a floor, then:
 #   1. the belt has two slots and starts empty;
 #   2. `/toolbelt put` inserts a tool, `/toolbelt take` moves it back;
 #   3. a stackable item (stone) is refused by the default rule, and a third
@@ -10,7 +12,15 @@
 #   5. a click on a belt slot moves that stack to the player;
 #   6. a right-click with the belt and an off-hand tool inserts the off-hand
 #      stack (the click path);
-#   7. the same world without --dev-mod registers nothing (the control).
+#   7. a shulker box (a container) is refused, so no belt-box-belt nesting;
+#   8. the belt's and the pouch's carried recipes craft in a real crafting table,
+#      consuming their ingredients, and the belt pattern without its iron ingot
+#      stays empty (`tools/craft_check.py`);
+#   9. a pouch takes a belt from two slots to nine in a real anvil, one pouch and
+#      the jar's level cost per step, keeping the stored tool; leather and a
+#      nine-slot belt produce no result (`tools/anvil_check.py`);
+#  10. with CONTROL_GAME, the same world on a game without the package knows no
+#      belt and no `/toolbelt`.
 #
 # SELFTEST=1 asserts the impossible (the refused stone is in the belt), which
 # must fail: it proves the storage assertions are not vacuous.
@@ -19,23 +29,29 @@ trap 'echo "FAILED at line $LINENO: $BASH_COMMAND" >&2' ERR
 
 CLONE=/home/adlf/Desktop/all_the_mods_10_rust_rewrite
 PORT=$CLONE/ports/toolbelt
-CTL=${CTL:-$CLONE/ports/_shared/bin/horizon-1d63e0a5/horizon-ctl}
-GAME=${GAME:-$PORT/target/horizon-cargo/fast/horizon-client}
+# The launcher's own control client (`launcher-game.sh env <mod>` exports CTL).
+# It must be the pin's, so there is no fallback to another build's binary.
+CTL=${CTL:-}
+GAME=${GAME:-}
+CONTROL_GAME=${CONTROL_GAME:-}
 RES=${RES:-${HORIZON_RES:-/home/adlf/Desktop/horizon/.local/horizon-client/26.3}}
 SOCK=${SOCK:-/tmp/opencode/toolbelt-e2e.sock}
 SELFTEST=${SELFTEST:-0}
-# EMBEDDED=1 launches the native bundle alone (no --dev-mod): the content comes
-# from `mixins/toolbelt/data/toolbelt-content.hmod` written out at start.
-EMBEDDED=${EMBEDDED:-0}
-DEV_ARGS=()
-[ "$EMBEDDED" = 1 ] || DEV_ARGS=(--dev-mod "$PORT/content")
 
 BELT=toolbelt:belt
 
+[ -n "$CTL" ] || {
+    echo "missing CTL: run eval \"\$(ports/tools/launcher-game.sh env toolbelt)\"" >&2
+    exit 1
+}
 [ -x "$CTL" ] || { echo "missing horizon-ctl: $CTL" >&2; exit 1; }
 [ -x "$GAME" ] || { echo "missing horizon-client: $GAME" >&2; exit 1; }
 [ -d "$RES/assets" ] || { echo "missing prepared resources: $RES" >&2; exit 1; }
-[ -f "$PORT/content/horizon-mod.toml" ] || { echo "missing content mod: $PORT/content" >&2; exit 1; }
+[ -n "$GAME" ] || {
+    echo "missing GAME: point it at a launcher-built horizon-client that carries toolbelt" >&2
+    echo "  horizon-launcher native-build $PORT --instance <i> --trust-native-code" >&2
+    exit 1
+}
 
 SCRATCH=$(mktemp -d "${E2E_TMP:-/tmp/opencode}"/toolbelt-home.XXXXXX)
 export HORIZON_HOME=$SCRATCH/game
@@ -81,29 +97,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-say "launch (offscreen renderer, creative, content --dev-mod content/)"
+say "launch (offscreen renderer, creative, the package compiled into the game)"
 "$CTL" --socket "$SOCK" launch \
     --game "$GAME" --world ToolBeltE2E --seed 20261109 --creative --offscreen --wait \
-    --game-dir "$SCRATCH/game" --resources "$RES" "${DEV_ARGS[@]}"
+    --game-dir "$SCRATCH/game" --resources "$RES"
 ctl wait-ready 180
-if [ "$EMBEDDED" = 1 ]; then
-    cache=$(find "$SCRATCH" "$PORT" -maxdepth 5 -name "toolbelt-embedded-content.hmod" 2>/dev/null | head -1)
-    if [ -n "$cache" ]; then
-        cmp -s "$cache" "$PORT/content/toolbelt.hmod" \
-            || fail "the embedded content differs from content/toolbelt.hmod"
-        echo "  embedded content: $(wc -c <"$cache" | tr -d ' ') B, identical to content/toolbelt.hmod"
-    else
-        # The game consumes the written package into its own content cache; the
-        # loader's startup line is then the proof that the bundle's copy loaded.
-        grep -q 'content from 1 mod(s)' "${SOCK}.log" \
-            || fail "the bundle's embedded content did not load (no 'content from 1 mod(s)' in ${SOCK}.log)"
-        echo "  embedded content: loaded from the bundle (game content cache rebuilt at startup)"
-    fi
-fi
-if grep -q "content mods not loaded" "${SOCK}.log" 2>/dev/null; then
-    grep "content mods not loaded" "${SOCK}.log" >&2
-    fail "the content mod did not load"
-fi
 ctl command "execute in minecraft:the_end run tp @s 0.5 64 0.5" >/dev/null
 ctl wait 10
 ctl command "execute in minecraft:the_end run fill -8 63 -8 8 63 8 minecraft:stone" >/dev/null
@@ -123,6 +121,13 @@ line=$(info)
 echo "readout: $line"
 echo "$line" | grep -q "size=2" || fail "a new belt is not size 2: $line"
 [ "$(belt_slots)" = 0 ] || fail "a new belt is not empty: $line"
+
+say "/toolbelt help lists its five usages"
+ctl chat "/toolbelt help" >/dev/null
+ctl wait 4
+help_lines=$(ctl messages 8 | jq -r '.chat[]' | grep -c '^/toolbelt ' || true)
+echo "help lists: $help_lines usages"
+[ "$help_lines" = 5 ] || fail "/toolbelt help did not list five usages (got $help_lines)"
 
 say "put and take a tool"
 ctl chat "/toolbelt put minecraft:iron_pickaxe 1" >/dev/null
@@ -202,6 +207,20 @@ off=$(ctl inventory | jq -r '.offhand.item // "none"')
 echo "offhand after: $off"
 [ "$off" != "minecraft:iron_shovel" ] || fail "the off-hand still holds the inserted shovel"
 
+say "control: a container-bearing stack (a shulker box) is refused"
+ctl command "clear @s minecraft:stone" >/dev/null
+ctl wait 3
+ctl give minecraft:shulker_box 1 >/dev/null
+ctl wait 4
+before=$(info)
+ctl chat "/toolbelt put minecraft:shulker_box 1" >/dev/null
+ctl wait 4
+line=$(info)
+echo "readout: $line"
+echo "$line" | grep -q "minecraft:shulker_box" && fail "a shulker box went into the belt: $line"
+[ "$(count_item minecraft:shulker_box)" = 1 ] || fail "the refused shulker box left the inventory"
+[ "$before" = "$line" ] || fail "the refused shulker box changed the belt: '$before' -> '$line'"
+
 if [ "$SELFTEST" = 1 ]; then
     say "SELFTEST: the refused stone must be in the belt (it is not)"
     info | grep -q "minecraft:stone" \
@@ -227,29 +246,38 @@ echo "readout after:  $after"
 ctl command "clear @s minecraft:stone" >/dev/null
 ctl wait 3
 
-say "control: the same world without --dev-mod registers nothing"
-ctl quit >/dev/null 2>&1 || true
-sleep 1
-rm -f "$SOCK"
-# The bundle now embeds its own content (the AE2 pattern). Block that one file
-# with a directory of the same name under the game's cache root, so the helper
-# can neither read nor write it and falls back to `Continue`; the rest of the
-# cache (the game's own mod-content staging) is untouched.
-rm -f "$SCRATCH/game/.horizon-cache/toolbelt-embedded-content.hmod"
-mkdir -p "$SCRATCH/game/.horizon-cache/toolbelt-embedded-content.hmod"
-"$CTL" --socket "$SOCK" launch \
-    --game "$GAME" --world ToolBeltNoMod --seed 20261109 --creative --offscreen --wait \
-    --game-dir "$SCRATCH/game" --resources "$RES"
-ctl wait-ready 180
-ctl give "$BELT" 1 >/dev/null 2>&1 || true
+say "the carried recipes craft in a real crafting table"
+ctl command "clear @s" >/dev/null
+ctl command "execute in minecraft:the_end run setblock 5 64 5 minecraft:crafting_table" >/dev/null
 ctl wait 3
-[ "$(count_item "$BELT")" = 0 ] || fail "without --dev-mod the belt item was known"
-echo "without --dev-mod: give $BELT added nothing"
-ctl chat "/toolbelt info" >/dev/null
-ctl wait 3
-if ctl messages 6 | jq -r '.chat[]' | grep -q "^toolbelt:belt "; then
-    fail "without --dev-mod the /toolbelt command answered"
-fi
-echo "without --dev-mod: /toolbelt answered nothing"
+python3 "$PORT/tools/craft_check.py" "$SOCK" "$CTL" 5 64 5 \
+    || fail "the carried recipes did not craft"
 
-echo "PASS: the belt stores tools, refuses stackables and overflow, shows them in its menu, gives one back on a click, takes an off-hand tool on a right-click, keeps a tool in the belt when the inventory cannot take it, and registers nothing without --dev-mod"
+say "a pouch upgrades a belt to nine slots at an anvil, at the jar's level costs"
+ctl command "execute in minecraft:the_end run setblock 2 64 0 minecraft:anvil" >/dev/null
+ctl wait 3
+python3 "$PORT/tools/anvil_check.py" "$SOCK" "$CTL" 2 64 0 \
+    || fail "the anvil upgrade chain did not hold"
+
+if [ -n "$CONTROL_GAME" ]; then
+    say "control: the same world on a game without the package"
+    ctl quit >/dev/null 2>&1 || true
+    sleep 1
+    rm -f "$SOCK"
+    "$CTL" --socket "$SOCK" launch \
+        --game "$CONTROL_GAME" --world ToolBeltNoMod --seed 20261109 --creative --offscreen --wait \
+        --game-dir "$SCRATCH/game" --resources "$RES"
+    ctl wait-ready 180
+    ctl give "$BELT" 1 >/dev/null 2>&1 || true
+    ctl wait 3
+    [ "$(count_item "$BELT")" = 0 ] || fail "the control game knew the belt item"
+    echo "  without the package: give $BELT added nothing"
+    ctl chat "/toolbelt info" >/dev/null
+    ctl wait 3
+    if ctl messages 6 | jq -r '.chat[]' | grep -q "^toolbelt:belt "; then
+        fail "the control game's /toolbelt answered"
+    fi
+    echo "  without the package: /toolbelt answered nothing"
+fi
+
+echo "PASS: the belt stores tools, refuses stackables, overflow and a container-bearing shulker box, shows them in its menu, gives one back on a click, takes an off-hand tool on a right-click, keeps a tool in the belt when the inventory cannot take it, its belt and pouch recipes craft in a table, and a pouch takes it from two to nine anvil slots at the jar's level costs"

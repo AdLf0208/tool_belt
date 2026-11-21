@@ -20,6 +20,14 @@ pub const MAX_SIZE: u8 = 9;
 /// `minecraft:bundle` is always refused (`ConfigData.isItemStackAllowed`).
 pub const BUNDLE_ITEM: &str = "minecraft:bundle";
 
+/// The pouch item (`ToolBelt.POUCH`, a plain item): the anvil's right input that
+/// grows a belt by one slot.
+pub const POUCH_ITEM: &str = "toolbelt:pouch";
+
+/// `ToolBelt.XP_COSTS`, one entry per step: two slots to three costs 3 levels,
+/// three to four 5, and so on up to eight to nine at 30.
+pub const UPGRADE_XP_COSTS: [i32; (MAX_SIZE - MIN_SIZE) as usize] = [3, 5, 8, 12, 15, 20, 30];
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BeltStack {
     pub item: String,
@@ -28,6 +36,11 @@ pub struct BeltStack {
     /// A stable fingerprint of the stack's components: two stacks only merge
     /// when item *and* components agree (`ItemStack.isSameItemSameComponents`).
     pub variant: u64,
+    /// Whether the stack itself can hold other stacks: a shulker box, a bundle,
+    /// or any item declaring a `minecraft:container` component. Such a stack is
+    /// refused: a belt inside a shulker box inside a belt would otherwise nest
+    /// without a bound (a review finding of 2026-11-18).
+    pub container_bearing: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -56,6 +69,31 @@ pub fn slot_count(size: u8) -> usize {
     usize::from(clamp_size(size))
 }
 
+/// The levels an anvil upgrade costs for a belt of `size` slots
+/// (`ToolBelt.getUpgradeXP`), or `None` at nine slots: a full belt has no result.
+/// Every size is clamped first, as `getBeltSize` clamps, so upstream's own
+/// unreachable `slots < 2` branch (one level) never applies here either.
+pub fn upgrade_cost(size: u8) -> Option<i32> {
+    let size = clamp_size(size);
+    if size >= MAX_SIZE {
+        return None;
+    }
+    Some(UPGRADE_XP_COSTS[usize::from(size - MIN_SIZE)])
+}
+
+/// The size after one anvil upgrade (`ToolBeltItem.makeUpgradedStack`), or
+/// `None` when the belt is already at nine slots.
+pub fn upgraded_size(size: u8) -> Option<u8> {
+    let size = clamp_size(size);
+    (size < MAX_SIZE).then_some(size + 1)
+}
+
+/// Whether `item` is the stack the anvil consumes for an upgrade: exactly the
+/// pouch (`ToolBelt.anvilChange` tests `right.getItem() == POUCH`).
+pub fn is_upgrade_material(item: &str) -> bool {
+    item == POUCH_ITEM
+}
+
 /// `ConfigData.isItemStackAllowed`, minus the whitelist (not carried in this
 /// slice): a blacklisted item, a bundle or a belt is always refused, and
 /// stackable items are refused unless the policy allows them.
@@ -63,7 +101,7 @@ pub fn allows(policy: &Policy, stack: &BeltStack) -> bool {
     if stack.count == 0 {
         return true;
     }
-    if stack.item == BELT_ITEM || stack.item == BUNDLE_ITEM {
+    if stack.item == BELT_ITEM || stack.item == BUNDLE_ITEM || stack.container_bearing {
         return false;
     }
     if policy.blacklist.iter().any(|id| id == &stack.item) {
@@ -155,6 +193,7 @@ mod tests {
             count,
             max_stack,
             variant: 0,
+            container_bearing: false,
         }
     }
 
@@ -193,6 +232,32 @@ mod tests {
         assert!(allows(&permissive, &stack("minecraft:stone", 64, 64)));
         assert!(!allows(&permissive, &stack(BELT_ITEM, 1, 1)));
         assert!(!allows(&permissive, &stack(BUNDLE_ITEM, 1, 1)));
+    }
+
+    #[test]
+    fn a_container_bearing_stack_never_enters_a_belt() {
+        let permissive = Policy {
+            allow_stackable: true,
+            blacklist: Vec::new(),
+        };
+        for item in [
+            "minecraft:shulker_box",
+            "minecraft:white_shulker_box",
+            "minecraft:bundle",
+        ] {
+            let mut shulker = stack(item, 1, 1);
+            shulker.container_bearing = true;
+            assert!(
+                !allows(&permissive, &shulker),
+                "{item} can hold a belt, so a belt must not hold it"
+            );
+        }
+        let mut sword = stack("minecraft:netherite_sword", 1, 1);
+        sword.container_bearing = false;
+        assert!(
+            allows(&Policy::default(), &sword),
+            "a plain tool still fits"
+        );
     }
 
     #[test]
@@ -268,6 +333,39 @@ mod tests {
             trimmed.truncate(2);
             trimmed
         });
+    }
+
+    #[test]
+    fn an_upgrade_costs_the_jars_seven_level_steps() {
+        assert_eq!(upgrade_cost(2), Some(3), "2 -> 3 slots costs 3 levels");
+        assert_eq!(upgrade_cost(3), Some(5));
+        assert_eq!(upgrade_cost(4), Some(8));
+        assert_eq!(upgrade_cost(5), Some(12));
+        assert_eq!(upgrade_cost(6), Some(15));
+        assert_eq!(upgrade_cost(7), Some(20));
+        assert_eq!(upgrade_cost(8), Some(30));
+        assert_eq!(upgrade_cost(9), None, "a nine-slot belt cannot grow");
+        assert_eq!(
+            upgrade_cost(0),
+            Some(3),
+            "every read clamps to two slots first, as getBeltSize does"
+        );
+    }
+
+    #[test]
+    fn one_upgrade_adds_one_slot_and_never_past_nine() {
+        assert_eq!(upgraded_size(2), Some(3));
+        assert_eq!(upgraded_size(8), Some(9));
+        assert_eq!(upgraded_size(9), None);
+        assert_eq!(upgraded_size(40), None, "clamped to nine, so it is full");
+    }
+
+    #[test]
+    fn only_the_pouch_upgrades_a_belt() {
+        assert!(is_upgrade_material(POUCH_ITEM));
+        assert!(!is_upgrade_material("minecraft:leather"));
+        assert!(!is_upgrade_material("minecraft:string"));
+        assert!(!is_upgrade_material(BELT_ITEM));
     }
 
     #[test]

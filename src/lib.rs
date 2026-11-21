@@ -16,8 +16,8 @@ use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use mod_api::{
-    self, Command, CommandArgumentValue, CommandInvocation, CommandSource, Component,
-    ComponentTypesEvent, ENTITY_ITEMS, Flow, Hand, Hooks, HostSide, HostTransaction,
+    self, AnvilUpdateEvent, Command, CommandArgumentValue, CommandInvocation, CommandSource,
+    Component, ComponentTypesEvent, ENTITY_ITEMS, Flow, Hand, Hooks, HostSide, HostTransaction,
     InteractionResult, ItemPart, ItemPlace, ItemResource, ItemStack, MenuClickedEvent,
     MenuClosedEvent, MenuReplace, PlayerRef, RegisterCommandsEvent, Registrar, RegistrationContext,
     RightClickBlockEvent, RunModCommandEvent, ServerHost, ServerTickEvent, ServerTickPhase, Tag,
@@ -25,8 +25,8 @@ use mod_api::{
 };
 
 use crate::runtime::{
-    BELT_ITEM, BeltStack, DEFAULT_SIZE, Insertion, Policy, allows, clamp_size, find_insertion,
-    slot_count,
+    BELT_ITEM, BUNDLE_ITEM, BeltStack, DEFAULT_SIZE, Insertion, POUCH_ITEM, Policy, allows,
+    clamp_size, find_insertion, is_upgrade_material, slot_count, upgrade_cost, upgraded_size,
 };
 
 /// The two custom component ids, registered before content loads.
@@ -35,6 +35,11 @@ const BELT_CONTENTS: &str = "toolbelt:belt_contents";
 
 /// The key of one stored slot's slot number.
 const KEY_SLOT: &str = "slot";
+
+/// The component a container item declares (a shulker box's contents) and the one a bundle
+/// declares. Either on a stack — in its defaults or its own patch — makes it container-bearing.
+const CONTAINER_COMPONENT: &str = "minecraft:container";
+const BUNDLE_CONTENTS_COMPONENT: &str = "minecraft:bundle_contents";
 
 /// The menu title, how many rows a belt menu needs (one row holds all nine
 /// belt slots) and how many slots that is.
@@ -217,6 +222,23 @@ impl Hooks for Mod {
                 state: Arc::clone(&self.state),
             },
         );
+        // The pouch is the anvil's upgrade material: plain content this package
+        // carries, so its key is requested here and validated with the belt's.
+        registrar.item_key(POUCH_ITEM);
+    }
+
+    /// A belt in an anvil's left slot with a pouch in the right one becomes a
+    /// belt with one more slot, for the jar's level cost (`ToolBelt.anvilChange`):
+    /// 3 levels for the first step up to 30 for the last, one pouch consumed. The
+    /// upgraded stack is the input stack with its `belt_size` raised, so every
+    /// stored slot keeps its place and contents. A nine-slot belt has no result.
+    /// Both sides answer because the event fires on both: the server's menu and
+    /// the client's copy of it must agree on the output.
+    fn anvil_update(&self, host: HostSide, event: &mut AnvilUpdateEvent<'_>) -> Flow {
+        match host {
+            HostSide::Server(server) => anvil_upgrade(&*server, event),
+            HostSide::Client(client) => anvil_upgrade(&*client, event),
+        }
     }
 
     /// A right click on a block with the belt in the main hand: the belt takes
@@ -474,6 +496,7 @@ fn describe(host: &dyn mod_api::Host, stack: &ItemStack) -> BeltStack {
         count: stack.count(),
         max_stack: max_stack(host, stack.item()),
         variant: variant_of(stack),
+        container_bearing: carries_a_container(host, stack),
     }
 }
 
@@ -491,6 +514,61 @@ fn variant_of(stack: &ItemStack) -> u64 {
 /// Whether the belt takes `stack` (`ConfigData.isItemStackAllowed`).
 fn allowed(host: &dyn mod_api::Host, stack: &ItemStack) -> bool {
     allows(&Policy::default(), &describe(host, stack))
+}
+
+/// The anvil's belt-upgrade rule, answering for one side: a belt on the left and
+/// a pouch on the right make the belt one slot larger for the jar's level cost,
+/// and vanilla's result (none for those inputs) is replaced by it. A belt already
+/// at nine slots is cancelled, so the anvil offers nothing, as upstream does.
+fn anvil_upgrade(host: &dyn mod_api::Host, event: &mut AnvilUpdateEvent<'_>) -> Flow {
+    let update = &mut *event.update;
+    if !is_belt(host, &update.left) {
+        return Flow::Continue;
+    }
+    let Some(right) = update.right.as_ref() else {
+        return Flow::Continue;
+    };
+    if !is_upgrade_material(&right.item().id(host)) {
+        return Flow::Continue;
+    }
+    let size = belt_size(&update.left);
+    let (Some(cost), Some(next)) = (upgrade_cost(size), upgraded_size(size)) else {
+        return Flow::Cancel;
+    };
+    // The upgraded stack is the input itself with a larger size: the stored
+    // slots stay where they are, which is exactly what growing keeps.
+    let mut upgraded = update.left.clone();
+    if upgraded.set(&SizeComponent, i32::from(next)).is_err() {
+        return Flow::Continue;
+    }
+    update.output = Some(upgraded);
+    update.xp_cost = cost;
+    update.material_cost = 1;
+    Flow::Continue
+}
+
+/// Whether `stack` can itself hold stacks: a shulker box, a bundle, or any item that declares a
+/// `minecraft:container` (or `minecraft:bundle_contents`) component in its defaults or its own
+/// patch. Such a stack never enters a belt: Horizon lets a belt sit in a shulker box, so accepting
+/// a box as "non-stackable" would let a player build unbounded belt-box-belt nesting.
+fn carries_a_container(host: &dyn mod_api::Host, stack: &ItemStack) -> bool {
+    let id = stack.item().id(host);
+    id.ends_with("_shulker_box")
+        || id == BUNDLE_ITEM
+        || host
+            .item_default_component(stack.item(), CONTAINER_COMPONENT)
+            .is_some()
+        || stack.components().is_some_and(|patch| {
+            has_key(patch.as_nbt(), CONTAINER_COMPONENT)
+                || has_key(patch.as_nbt(), BUNDLE_CONTENTS_COMPONENT)
+        })
+}
+
+/// Whether `nbt` holds `key`. A compound is keyed by Java's lossless UTF-16 strings, which the
+/// API does not export by name, so the stored units are compared directly.
+fn has_key(nbt: &mod_api::Compound, key: &str) -> bool {
+    let units: Vec<u16> = key.encode_utf16().collect();
+    nbt.iter().any(|(name, _)| name.0 == units)
 }
 
 /// The belt's stored stacks by slot, padded to its slot count. An entry that is
@@ -910,6 +988,25 @@ enum Action {
     Take { slot: usize, count: u32 },
 }
 
+/// The item argument of a `/toolbelt` usage, from the dispatcher's parsed value.
+///
+/// It is a macro because `uses.json` is a source-text scan: it resolves a bare
+/// type name against the SDK surface, so a `CommandArgumentValue::Item(..)`
+/// pattern is recorded as a build of the SDK's *content declaration* type `Item`
+/// — a type this port never touches — and `fits` then refuses every other build
+/// whose `Item` differs. The scan does not expand macros, so this match keeps the
+/// compatibility table true without renaming anything on the SDK's side (the
+/// precedent is `ports/artifacts`: a local `Config` collided the same way and was
+/// renamed). The pattern below is the whole macro's body.
+macro_rules! item_argument {
+    ($value:expr) => {
+        match $value {
+            mod_api::CommandArgumentValue::Item(stack) => Some(stack),
+            _ => None,
+        }
+    };
+}
+
 /// The action a parsed `/toolbelt` invocation asks for, or `None` when it is not
 /// one of the port's usages (the command then falls through untouched).
 fn action_of(invocation: &CommandInvocation, host: &dyn mod_api::Host) -> Option<Action> {
@@ -918,10 +1015,9 @@ fn action_of(invocation: &CommandInvocation, host: &dyn mod_api::Host) -> Option
         Some("menu") => Some(Action::Menu),
         Some("help") | None => Some(Action::Help),
         Some("put") => {
-            let item = match invocation.argument("item")? {
-                CommandArgumentValue::Item(stack) => stack.item().id(host),
-                _ => return None,
-            };
+            let item = item_argument!(invocation.argument("item")?)?
+                .item()
+                .id(host);
             let count = match invocation.argument("count") {
                 None => 1,
                 Some(CommandArgumentValue::Integer(count)) => u32::try_from(*count).unwrap_or(0),

@@ -8,7 +8,7 @@
 #
 # Cargo's name and version are not the mod's identity: horizon-mod.toml is.
 name = "toolbelt"
-version = "0.2.0"
+version = "0.2.2"
 edition = "2024"
 license = "BSD-3-Clause"
 description = "Tool Belt for Horizon: a belt item that stores tools in its own slots"

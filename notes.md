@@ -14,16 +14,21 @@ ATM10 jar is `ToolBelt-1.21.1-2.2.10.jar`, SHA-1
 **Format: the SDK package (2026-11-18).** This port was migrated from the
 retired `.hnmod` container to the flat SDK package — see
 [`## Migration to the SDK format`](#migration-to-the-sdk-format) for the file
-map, the helper mapping and every trap. `src/runtime.rs` is **byte-identical**
-to the retired `mixins/toolbelt/runtime.rs` (SHA-256
-`9ba28129540def12bc3db9182728cdc4f04dad749df09a0e3c418dcc4e831aa0`),
-including the copy inside the built package. Version **0.2.0**; the retired
-submission was `toolbelt` 0.1.0 (PR **#573**, closed by the format purge).
+map, the helper mapping and every trap. `src/runtime.rs` **carries** the retired
+`mixins/toolbelt/runtime.rs`, the review-fix `container_bearing` rule and the
+0.2.2 anvil-upgrade rules (see [`## Slice 2`](#slice-2--the-belt-upgrade-the-pouch-and-the-anvil-022));
+its pre-0.2.2 file was SHA-256
+`e6ed170244c7e46e112dfc406efe5abe9ef8efb259ef29be8674226706ceba78`.
+Version **0.2.2**; the retired submission was `toolbelt` 0.1.0 (PR **#573**,
+closed by the format purge). Pin: SDK nightly
+**`0a875da91dbb0fdcb7ba8c42c11341aa229af51a`** (2026-11-20) + horizon-mixins
+`e59da9094f0c2fdda6c627fe9eff22dec6a906f0` (repinned from `0b14f8a` in 0.2.2).
 
-Status: **slice 1 implemented and verified in-game** (in the retired format) —
-the belt item, its two-to-nine-slot on-item storage, the insert/extract rules,
-a belt menu, and the click interactions. The radial key menu, wearing/Curios,
-upgrades and the pouch are deferred (see Gaps).
+Status: **slices 1 and 2 implemented and verified in-game** — the belt item, its
+two-to-nine-slot on-item storage, the insert/extract rules, a belt menu, the
+click interactions, the pouch item with both carried recipes, and the anvil
+upgrade from two to nine slots. The radial key menu, wearing/Curios, the
+sewing-kit upgrades and the server config are deferred (see Gaps).
 
 ## Approach (from the pin's `docs/modpacks.md`)
 
@@ -361,6 +366,180 @@ entries** (133,092 B unpacked): `horizon-mod.toml`, `Cargo.toml`, `LICENSE`,
     the exact 40 hex from `sdk.json`, and the mixins commit is `e59da909…`, not
     the old campaign pin.
 
+## Slice 2 — the belt upgrade: the pouch and the anvil (0.2.2)
+
+**The gap line this closes**, from `## Slice boundary` above: *"anvil/sewing upgrades;
+the pouch item and the dyed belt"*. It is one family, not three: the jar's pouch exists
+**only** as the anvil's upgrade material and as a crafted ingredient
+(`ToolBelt.POUCH = ITEMS.registerSimpleItem("pouch")`), and the anvil is the only
+upgrade path that does not need another mod (the seven `belt_upgrade_*_via_sewing`
+recipes carry `neoforge:mod_loaded sewingkit`, which is not in the registry). Tier
+`machines`: a carried item, its recipe and a menu mechanic, no renderer and no entity.
+
+Read from upstream (`gigaherz/ToolBelt` at `2737d42`, `ToolBelt.java` and
+`belt/ToolBeltItem.java`):
+
+| Rule | Upstream | This port |
+|---|---|---|
+| inputs | left item is `BELT`, right item is `POUCH` | same |
+| output | `makeUpgradedStack(left)`: the belt with `belt_size + 1` | the left stack cloned, `toolbelt:belt_size` raised |
+| level cost | `XP_COSTS = {3, 5, 8, 12, 15, 20, 30}` for 2→3 … 8→9 | `UPGRADE_XP_COSTS`, same table |
+| material cost | `setMaterialCost(1)` (one pouch) | `material_cost = 1` |
+| nine slots | `getUpgradeXP` answers −1 and the event is cancelled | `upgrade_cost(9) == None`, the hook answers `Flow::Cancel` |
+| contents | kept (the copy keeps its container) | kept: only the size component changes |
+| config | `enableAnvilUpgrading` (AUTO: on without the sewing kit) | **always on** — the config family is still a gap |
+
+### TDD — red, then green
+
+The pure rules landed first as tests in `src/runtime.rs`
+(`an_upgrade_costs_the_jars_seven_level_steps`,
+`one_upgrade_adds_one_slot_and_never_past_nine`, `only_the_pouch_upgrades_a_belt`).
+Before the implementation existed the run failed to compile:
+
+```
+error[E0425]: cannot find value `POUCH_ITEM` in this scope
+error[E0425]: cannot find function `upgrade_cost` in this scope
+error[E0425]: cannot find function `upgraded_size` in this scope
+error[E0425]: cannot find function `is_upgrade_material` in this scope
+…
+error: could not compile `toolbelt` (lib test) due to 18 previous errors
+```
+
+(`../_shared/evidence/toolbelt/upgrade-test-red.log`.) Then the engine
+(`upgrade_cost`, `upgraded_size`, `is_upgrade_material`, `POUCH_ITEM`) and the
+`anvil_update` hook, and `cargo test`: **20 passed, 0 failed** (`sdk-test.log`
+quotes two `test result: ok.` lines: 20 library tests and the 0-test binary).
+
+### The hook
+
+`Hooks::anvil_update` (stamped, `hook:anvil_update`, side both) answers on both sides
+with the same pure rule: the belt's size and a pouch in the right input make the left
+stack with one more slot, `xp_cost` from the table and `material_cost = 1`; a nine-slot
+belt answers `Flow::Cancel`, so no result. Both sides answer because the event fires on
+both — the server's menu and the client's copy must agree.
+
+### A `uses.json` name collision, fixed at the source of the record
+
+`cargo horizon-mod check` warned that `type:Item` was "built field by field", and
+`fits --build 0b14f8a` refused the package (`does not fit: 1 item changed`). Root cause is
+the same class `ports/artifacts` recorded on 2026-11-20: `uses.json` is a **source-text
+scan** that resolves a bare type name against the SDK surface, and our
+`CommandArgumentValue::Item(..)` pattern in `action_of` was recorded as a build of the
+SDK's content-declaration type `Item` — a type this port never touches. Renaming the SDK
+variant is not possible, and an `as` alias on the import is resolved back to the variant
+(measured: the record stayed), so the one match lives in a small `item_argument!` macro
+(the scan does not expand macros) with a comment saying exactly why. `uses.json` is now
+truthful: no `type:Item` entry, and `fits --build 0b14f8a` prints `fits`
+(`sdk-fits-other.log`).
+
+### Slice 2 ladder (pin `0a875da`, mixins `e59da90`)
+
+Skills: superpowers/using-superpowers, brainstorming, writing-plans, test-driven-development, systematic-debugging, verification-before-completion; BeautifulRust/rust-best-practices
+
+Every step ran through `ports/tools/build-slot.sh` with `CARGO_INCREMENTAL=0` and
+`BUILD_LOCAL=1` (the SDK fetch and the launcher build are local).
+
+| Step | Command | Result | Log |
+|---|---|---|---|
+| red | `cargo test` with the three new tests only | **18 × `E0425`**, `could not compile` | `upgrade-test-red.log` |
+| tests | `cargo test --offline` | `test result: ok. 20 passed; 0 failed` + `TEST_EXIT:0` | `sdk-test.log` |
+| lints | `cargo clippy --all-targets --offline -- -D warnings` | `CLIPPY_EXIT:0`, no warning | `sdk-clippy.log` |
+| format | `cargo fmt && cargo fmt --check` | `FMT_EXIT:0` | `sdk-fmt.log` |
+| build ×2 | `rm -f Cargo.lock && cargo horizon-mod build` | both `BUILD_EXIT:0`, `cmp` identical | `sdk-build.log`, `sdk-build-second.log` |
+| registry check | `cargo horizon-mod check toolbelt.hmod` | `48303 bytes, SHA-256 1eb80603…aa20b`, `CHECK_EXIT:0` | `sdk-check.log` |
+| fits, pin | `cargo horizon-mod fits toolbelt.hmod --build 0a875da` | `0a875da  made for` | `sdk-fits.log` |
+| fits, other | `… --build 0b14f8a` | `0b14f8a  fits`, `FITS_EXIT:0` | `sdk-fits-other.log` |
+| gate | `python3 ports/tools/verify-sdk-package.py toolbelt` | `1/1 package(s) verified` | — |
+| e2e | `build-slot.sh run --step e2e -- tools/e2e.sh` | `PASS` + `EXIT:0` | `toolbelt-e2e/e2e-launcher-0.2.2.log` |
+| e2e control | `GAME=$CONTROL_GAME …` | `FAIL: a new belt is not size 2` + `EXIT:1` | `toolbelt-e2e/e2e-launcher-control-0.2.2.log` |
+| e2e selftest | `SELFTEST=1 …` | `FAIL: SELFTEST: … (the check is alive)` + `EXIT:1` | `toolbelt-e2e/e2e-selftest-0.2.2.log` |
+| log gate | `check-e2e-logs.py toolbelt-e2e --strict` | `logs=5 ok=5 missing-exit=0 bad-exit=0` | — |
+
+The package: **48,303 B**, SHA-256
+`1eb8060368a9f676606d19672b42367aae220502ea62c81e8209f32ac89aa20b`, **35 entries**
+(`horizon-mod.toml`, `Cargo.toml`, `LICENSE`, `LICENSE-NOTICE.md`, `README.md`,
+`src/lib.rs`, `src/runtime.rs`, `uses.json`, 23 `assets/toolbelt/**`, 4
+`data/toolbelt/**`); **no `Cargo.lock`**; `uses.json` 331 entries, `made_for 0a875da`.
+The two builds above were run after the in-game leg; the only change between the
+package the leg played and the delivered bytes is `README.md` (documentation, packed but
+not code), and a third build reproduced these exact bytes from the current sources.
+
+### Files
+
+| Action | Path |
+|---|---|
+| created | `data/toolbelt/horizon/item/pouch.json` (stick template, cooked-fuel removed: a plain 64-stack item) |
+| created | `assets/toolbelt/items/pouch.json`, `assets/toolbelt/models/item/pouch.json` (byte-identical to the jar), `assets/toolbelt/textures/item/pouch.png` (byte-identical, 17,670 B) |
+| created | `data/toolbelt/recipe/pouch.json` — the jar's `"sgs" / "l l" / "sls"` shaped recipe, its `neoforge:conditions` dropped like the belt's |
+| edited | `src/runtime.rs` (the three rules), `src/lib.rs` (the pouch key, `anvil_update`, `anvil_upgrade`, the `item_argument!` macro), `horizon-mod.toml`/`Cargo.toml` (`0.2.2`, `[native] horizon = 0a875da…`) |
+| created | `tools/craft_check.py` (both recipes + the belt pattern without its iron), `tools/anvil_check.py` (the eight steps + two controls) |
+| edited | `tools/e2e.sh` (the `/toolbelt help` leg, the recipe leg, the anvil leg; `CTL` now comes from `launcher-game.sh env`) |
+
+### In game (launcher-built package)
+
+`PASS` + `EXIT:0`, `../_shared/evidence/toolbelt-e2e/e2e-launcher-0.2.2.log`. Verbatim:
+
+```
+help lists: 5 usages
+belt recipe: 1 toolbelt:belt, 0 ingredients left
+pouch recipe: 1 toolbelt:pouch, 0 ingredients left
+belt pattern without iron: null
+belt + leather -> result None, cost 0
+step 2->3: result 'toolbelt:belt x1', cost 3, level 200
+  taken: belt at slot 8 size 3, pouches 8->7, level 200->197
+…
+step 8->9: result 'toolbelt:belt x1', cost 30, level 137
+  taken: belt at slot 8 size 9, pouches 2->1, level 137->107
+nine-slot belt + pouch -> result None, cost 0, pouches 1->1
+final readout: toolbelt:belt size=9 slots=1/9 contents=[0:minecraft:iron_pickaxe(1)]
+anvil PASS: a pouch takes a belt from two to nine slots at the jar's seven level steps, one pouch each, with the stored tool kept; leather and a nine-slot belt produce no result
+```
+
+Every assertion can fail: the leather leg is the same code path with the wrong second
+item, the nine-slot leg is the table's missing tenth step, each level drop is checked
+against the jar's own distinct step (a constant cost fails at step 2→3), and the tool
+inside the belt is checked after every step (an upgrade that rebuilt the stack would lose
+it). The control game (`GAME=$CONTROL_GAME`) fails at the first readout —
+`FAIL: a new belt is not size 2` + `EXIT:1` (`e2e-launcher-control-0.2.2.log`) — and
+`SELFTEST=1` fails as designed (`e2e-selftest-0.2.2.log`). `check-e2e-logs.py
+toolbelt-e2e --strict`: `logs=5 ok=5 missing-exit=0 bad-exit=0`.
+
+Two harness facts this leg needed (they cost four probe runs):
+
+- **`ctl interact` with the belt in hand never opens the anvil**: the belt's own
+  `right_click_block` takes the click and opens the belt menu. Select another hotbar
+  slot first, or the "anvil" is really a 9-slot belt menu (its slot 300 is belt slot 0).
+- **An anvil opened by `interact` is a station** (`ctl menu` → `"station": "Anvil"`) with
+  inputs at **600/601** and the result at **650**; `click-slot` on the container ids
+  300.. does nothing for it. Shift-click (`click-slot N shift`) is the path that moves
+  the belt and the pouch in and the result out; the result slot's `components` (read
+  with `ctl screen`) carry `toolbelt:belt_size`, which is what the e2e asserts before
+  taking it.
+
+## Coverage — every family in the jar
+
+| Family (jar) | State | Where |
+|---|---|---|
+| `toolbelt:belt` item, `belt_size` 2..9 + contents components | tested | `e2e-launcher-0.2.2.log` (readout size/slots/contents legs) |
+| insert rule (only non-stackables, no belt/bundle/container) | tested | stone and shulker-box legs; `runtime.rs` unit tests |
+| capacity/merge/extract + full-inventory safety | tested | capacity leg, "extraction that does not fit" leg |
+| belt menu (list + click-to-take) | tested | menu leg |
+| off-hand right-click insert, sneak extract, click-to-open | tested | off-hand leg (sneak extract is the same `clicked` path, unit-tested) |
+| `/toolbelt put take info menu help` | tested | help (5 usages), put/take/info/menu legs |
+| belt recipe (shaped) | tested | `craft_check.py` |
+| `toolbelt:pouch` item + recipe | tested | `craft_check.py` |
+| anvil upgrade (2→9, XP table, one pouch, contents kept) | tested | `anvil_check.py` (leather and nine-slot controls) |
+| sewing-kit upgrade recipes | not ported | needs `sewingkit`, not in the registry |
+| radial menu + `key.toolbelt.*` | blocked(no client→server action helper at this pin) | ARCHITECTURE §3 gap table |
+| wearing the belt (Curios / own belt slot, `onWornTick`) | not ported | needs an accessory-slot API and the renderer |
+| `IItemInBelt` per-item tick | not ported | no item in this mod implements it; `ItemPart::inventory_tick` is the future shape |
+| dyed belt (dye component model override) | not ported | model/texture carried only for the belt's own model override |
+| custom screen background, player-layer renderer | not ported | client renderer; tier boundary |
+| tooltips (`text.toolbelt.tooltip`) | not ported | `ItemPart::tooltip` exists at the pin; client-side, unprovable through this harness |
+| server config: whitelist/blacklist, `allowAllNonStackableItems`, `anvilUpgrading` | not ported | needs `config_files()`/settings; today the port behaves as the AUTO defaults without the sewing kit |
+| hopper/item-capability (`Capabilities.Item`) | not ported | nothing to attach it to without the worn belt |
+| sounds, particles, creative-tab membership | not ported | cosmetic; `give`/recipes are the tested paths |
+
 ## Verification (the retired 0.1.0 slice, still the behaviour's evidence)
 
 Skills: superpowers/using-superpowers,writing-plans,test-driven-development,systematic-debugging,verification-before-completion; BeautifulRust/rust-best-practices,rust-port
@@ -477,22 +656,49 @@ instead of inserting one."*
 
 ## Files
 
-- `horizon-mod.toml` — the only manifest: `id = "toolbelt"`, `version = "0.2.0"`,
-  `api = "0.2"`, `side = "both"`, `[native]` pinned to `0b14f8a` / `e59da90`.
+- `horizon-mod.toml` — the only manifest: `id = "toolbelt"`, `version = "0.2.2"`,
+  `api = "0.2"`, `side = "both"`, `[native]` pinned to `0a875da` / `e59da90`.
 - `Cargo.toml` — one crate; the only dependency is `horizon-mod-api` from
   `.horizon/sdk/`.
-- `src/lib.rs` — the one `#[mod_api::horizon_mod] impl Hooks` and the belt's
-  `ItemPart`, with 6 glue tests.
-- `src/runtime.rs` — the pure engine, byte-identical to the retired file, with
-  its 10 tests.
-- `assets/toolbelt/**` (20 files), `data/toolbelt/**` (2 files) — the carried
-  content.
+- `src/lib.rs` — the one `#[mod_api::horizon_mod] impl Hooks` (11 hooks, `anvil_update`
+  among them) and the belt's `ItemPart`, with 6 glue tests.
+- `src/runtime.rs` — the pure engine with its 14 tests (the retired 10 plus the
+  container-bearing rule and the three upgrade rules).
+- `assets/toolbelt/**` (23 files), `data/toolbelt/**` (4 files) — the carried content
+  (the pouch's model, definition, texture, recipe and lang are part of it).
 - `LICENSE`, `LICENSE-NOTICE.md`, `README.md` — inside the package.
-- `tools/e2e.sh` — the retired in-game scenario (needs a launcher-built game).
-- `toolbelt.hmod` — the delivered package, 40,939 B, SHA-256
-  `15aee383066f320bcfa0196255aecc00981fc180a7fe0432cb7e74bd0da0eedd`.
+- `tools/e2e.sh`, `tools/craft_check.py`, `tools/anvil_check.py` — the in-game
+  scenario and its two recipe/menu drivers (they need a launcher-built game).
+- `toolbelt.hmod` — the delivered package, **48,303 B**, SHA-256
+  `1eb8060368a9f676606d19672b42367aae220502ea62c81e8209f32ac89aa20b`, 35 entries.
 - `FINDINGS.md`, `VALIDATION.md`, this file.
 - Evidence: `../_shared/evidence/toolbelt/` (`sdk-*.log`, `sdk-uses.json`,
-  `sdk-sha256.txt`, `sdk-fresh-clone.md` for determinism and the fresh-clone
-  run, the retired 0.1.0 tree under `retired-hnmod-0.1.0/`). Jar kept at
+  `sdk-sha256.txt`, `upgrade-test-red.log`, `sdk-fresh-clone.md` for determinism and
+  the fresh-clone run, the retired 0.1.0 tree under `retired-hnmod-0.1.0/`) and
+  `../_shared/evidence/toolbelt-e2e/` (`e2e-launcher-0.2.2.log`,
+  `e2e-launcher-control-0.2.2.log`, `e2e-selftest-0.2.2.log`). Jar kept at
   `../_shared/licence-cache/ToolBelt-1.21.1-2.2.10.jar`.
+
+## Review fixes (2026-11-18, PR #1206)
+
+The reviewer found the nesting check refused belts and bundles but accepted **shulker boxes** as
+ordinary non-stackable items, while Horizon lets a belt sit in a shulker box: ordinary players could
+build unbounded belt-box-belt nesting.
+
+- **Fix.** `BeltStack` gained `container_bearing`, set by `carries_a_container` from the item id
+  (`*_shulker_box`, bundle), the item's default `minecraft:container` component (every shulker box
+  declares it) and the stack's own `minecraft:container`/`minecraft:bundle_contents` patch;
+  `allows` refuses such a stack. The belt can no longer hold any container-bearing item.
+- **Test.** `a_container_bearing_stack_never_enters_a_belt` (permissive policy still refuses a
+  shulker box and a bundle; a plain tool still fits).
+- **In-game.** A shulker box is offered to the belt and refused (still in the inventory, readout
+  unchanged). Evidence: `../_shared/evidence/toolbelt-e2e/e2e-launcher.log` (`PASS` + `EXIT:0`) and
+  `e2e-launcher-control.log` (`EXIT:1`); checker green.
+- **Runtime file.** The pure engine gained `container_bearing`; its sha256 is now
+  `e6ed170244c7e46e112dfc406efe5abe9ef8efb259ef29be8674226706ceba78` (the retired bundle's file was
+  `9ba28129…`).
+- **Package.** `toolbelt.hmod`, **0.2.1**, 42,104 B, sha256
+  `966749f4998da4cc37eaaca0ccef6784bcf6e50ff5160e02ee6fc458f8242079`; two builds byte-identical,
+  `check` and `fits --build 0b14f8a` exit 0.
+
+Skills: superpowers/using-superpowers, brainstorming, writing-plans, test-driven-development, systematic-debugging, verification-before-completion; BeautifulRust/rust-best-practices, rust-port, rust-review
